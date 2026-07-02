@@ -282,6 +282,75 @@ def support_resistance(df, lookback=30):
     return {"support": recent["low"].min(), "resistance": recent["high"].max()}
 
 
+def fibonacci_levels(df, lookback=50):
+    """
+    Tính các mức Fibonacci retracement/extension từ đợt sóng (đỉnh-đáy) gần nhất
+    trong 'lookback' nến. Dùng để tham khảo vùng SL/TP hợp lý (không thay thế
+    cách tính ATR đang dùng, chỉ là lớp xác nhận thêm - confluence check).
+    """
+    recent = df.iloc[-lookback:].reset_index(drop=True)
+    if len(recent) < 10:
+        return None
+
+    high_idx = recent["high"].idxmax()
+    low_idx = recent["low"].idxmin()
+    swing_high = recent.loc[high_idx, "high"]
+    swing_low = recent.loc[low_idx, "low"]
+    diff = swing_high - swing_low
+    if diff <= 0:
+        return None
+
+    # Nếu đáy hình thành SAU đỉnh -> sóng đang giảm gần nhất -> retracement tính từ trên xuống
+    # Nếu đỉnh hình thành SAU đáy -> sóng đang tăng gần nhất -> retracement tính từ dưới lên
+    uptrend_leg = low_idx < high_idx
+
+    if uptrend_leg:
+        levels = {
+            "0.0": swing_high,
+            "23.6": swing_high - diff * 0.236,
+            "38.2": swing_high - diff * 0.382,
+            "50.0": swing_high - diff * 0.5,
+            "61.8": swing_high - diff * 0.618,
+            "78.6": swing_high - diff * 0.786,
+            "100.0": swing_low,
+            "ext_127.2": swing_high + diff * 0.272,
+            "ext_161.8": swing_high + diff * 0.618,
+        }
+    else:
+        levels = {
+            "0.0": swing_low,
+            "23.6": swing_low + diff * 0.236,
+            "38.2": swing_low + diff * 0.382,
+            "50.0": swing_low + diff * 0.5,
+            "61.8": swing_low + diff * 0.618,
+            "78.6": swing_low + diff * 0.786,
+            "100.0": swing_high,
+            "ext_127.2": swing_low - diff * 0.272,
+            "ext_161.8": swing_low - diff * 0.618,
+        }
+
+    return {"swing_high": swing_high, "swing_low": swing_low, "uptrend_leg": uptrend_leg, "levels": levels}
+
+
+def fib_confluence_note(fib, entry, sl, tp1, atr_value, tolerance_mult=0.5):
+    """
+    Kiểm tra SL/TP hiện tại có 'trùng' (nằm gần) 1 mức Fib quan trọng không.
+    Nếu trùng -> tăng độ tin cậy, trả về ghi chú mô tả. Ngưỡng 'trùng' = tolerance_mult * ATR.
+    """
+    if not fib:
+        return None
+    tolerance = atr_value * tolerance_mult
+    notes = []
+    key_levels = ["38.2", "50.0", "61.8", "ext_127.2", "ext_161.8"]
+    for name in key_levels:
+        price = fib["levels"][name]
+        if abs(sl - price) <= tolerance:
+            notes.append(f"SL gần trùng Fib {name}%")
+        if abs(tp1 - price) <= tolerance:
+            notes.append(f"TP1 gần trùng Fib {name}%")
+    return "; ".join(notes) if notes else None
+
+
 def detect_fvg(df):
     """
     Fair Value Gap đơn giản: khoảng trống giữa nến[-3] và nến[-1]
@@ -397,6 +466,7 @@ def generate_signal():
     atr_m5 = atr(df_m5).iloc[-1]
     adx_m15 = adx(df_m15).iloc[-1]
     sr = support_resistance(df_m5)
+    fib = fibonacci_levels(df_m30, lookback=50)
 
     session_ok = is_active_session()
     news_warning = check_upcoming_news()
@@ -502,6 +572,8 @@ def generate_signal():
         "liquidity_note": liquidity_note,
         "news_warning": news_warning,
         "block_reason": block_reason,
+        "fib": fib,
+        "fib_note": None,
     }
 
     if direction:
@@ -524,6 +596,7 @@ def generate_signal():
             tp3 = entry - tp1_distance * 1.6
 
         result.update({"entry": entry, "sl": sl, "tp1": tp1, "tp2": tp2, "tp3": tp3})
+        result["fib_note"] = fib_confluence_note(fib, entry, sl, tp1, atr_m5)
 
     return result
 
@@ -564,6 +637,13 @@ def format_message(sig, win_stats=None):
 
     lines.append(f"📈 RSI(14): {sig['rsi']:.1f}   |   ATR(14): {sig['atr']:.2f}   |   ADX(M15): {sig['adx']:.1f}")
     lines.append(f"🧱 Hỗ trợ: {sig['support']:.2f}   |   Kháng cự: {sig['resistance']:.2f}")
+    if sig.get("fib"):
+        lv = sig["fib"]["levels"]
+        lines.append(f"🔢 Fib (M30, {'sóng tăng' if sig['fib']['uptrend_leg'] else 'sóng giảm'}): "
+                      f"38.2%={lv['38.2']:.2f}  50%={lv['50.0']:.2f}  61.8%={lv['61.8']:.2f}  "
+                      f"| Ext 161.8%={lv['ext_161.8']:.2f}")
+    if sig.get("fib_note"):
+        lines.append(f"✨ Đồng thuận Fib: {sig['fib_note']}")
     lines.append(f"🕐 Phiên thanh khoản cao: {'Có' if sig['session_ok'] else 'Không'}")
     if sig["liquidity_note"]:
         lines.append(f"⚠️ {sig['liquidity_note']}")
