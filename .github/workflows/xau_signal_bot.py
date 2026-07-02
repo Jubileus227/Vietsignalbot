@@ -54,6 +54,22 @@ def get_ohlc(interval, outputsize=100):
     return df
 
 
+def resample_ohlc(df_m5, rule):
+    """
+    Gộp nến M5 thành khung lớn hơn (15min/30min/1h) NGAY TRONG MÁY,
+    không cần gọi thêm API -> tiết kiệm request, cho phép chạy nhanh hơn.
+    rule: '15min', '30min', '1h'
+    """
+    df = df_m5.set_index("datetime")
+    out = df.resample(rule).agg({
+        "open": "first",
+        "high": "max",
+        "low": "min",
+        "close": "last",
+    }).dropna()
+    return out.reset_index()
+
+
 # ============================================================
 # 2. CHỈ BÁO KỸ THUẬT
 # ============================================================
@@ -192,10 +208,12 @@ def detect_fvg(df):
 # 3. LOGIC TẠO TÍN HIỆU
 # ============================================================
 def generate_signal():
-    df_m5 = get_ohlc("5min")
-    df_m15 = get_ohlc("15min")
-    df_m30 = get_ohlc("30min")
-    df_h1 = get_ohlc("1h")
+    # Chỉ gọi API 1 lần (lấy nhiều nến M5), sau đó tự gộp thành M15/M30/H1
+    # -> tiết kiệm request, cho phép chạy mỗi 5 phút mà vẫn trong hạn mức free
+    df_m5 = get_ohlc("5min", outputsize=1000)  # ~3.5 ngày dữ liệu M5
+    df_m15 = resample_ohlc(df_m5, "15min")
+    df_m30 = resample_ohlc(df_m5, "30min")
+    df_h1 = resample_ohlc(df_m5, "1h")
 
     trend_m5 = detect_trend(df_m5)
     trend_m15 = detect_trend(df_m15)
