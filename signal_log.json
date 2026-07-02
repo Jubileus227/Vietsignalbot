@@ -1,1 +1,12 @@
-[]
+[
+  {
+    "time_iso": "2026-07-02T20:08:54.147344+00:00",
+    "direction": "SELL",
+    "entry": 4122.16069,
+    "sl": 4127.887195906297,
+    "tp1": 4115.63977,
+    "score": 2,
+    "mode": "mean_reversion",
+    "status": "pending"
+  }
+]
