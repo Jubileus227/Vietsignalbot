@@ -559,6 +559,32 @@ def mean_reversion_signal(current_price, sr, rsi_value, atr_value, near_threshol
     }
 
 
+def check_entry_chase(direction, current_price, ob, atr_value, max_atr_distance=2.5):
+    """
+    Kiểm tra giá hiện tại đã chạy quá xa vùng Order Block chưa (nguy cơ "mua đuổi/bán đuổi").
+    Nếu quá xa (>= max_atr_distance x ATR), trả về gợi ý entry CHỜ (limit) tại biên gần
+    của OB thay vì entry thị trường ngay - giống nguyên tắc "không mua đuổi, chờ giá về".
+    """
+    if not ob:
+        return None
+    zone_low, zone_high = ob["zone"]
+
+    if direction == "BUY":
+        ref_edge = zone_high  # biên gần nhất để chờ giá hồi về khi đang ở trên vùng OB
+        distance = current_price - ref_edge
+    else:
+        ref_edge = zone_low
+        distance = ref_edge - current_price
+
+    if distance <= 0 or atr_value <= 0:
+        return None  # giá còn trong/chưa vượt vùng OB, chưa cần cảnh báo
+
+    distance_atr = distance / atr_value
+    if distance_atr >= max_atr_distance:
+        return {"distance_atr": round(distance_atr, 1), "suggested_entry": ref_edge}
+    return None
+
+
 # ============================================================
 # 3. LOGIC TẠO TÍN HIỆU
 # ============================================================
@@ -713,6 +739,8 @@ def generate_signal():
         "fib": fib,
         "fib_note": None,
         "signal_mode": signal_mode,
+        "entry_type": "market",
+        "chase_warning": None,
     }
 
     if direction and signal_mode == "mean_reversion":
@@ -725,10 +753,14 @@ def generate_signal():
         result["fib_note"] = fib_confluence_note(fib, mr["entry"], mr["sl"], mr["tp1"], atr_m5)
 
     elif direction:
-        entry = current_price
+        # Kiểm tra giá hiện tại đã chạy quá xa vùng OB chưa -> tránh khuyến nghị mua/bán đuổi
+        chase = check_entry_chase(direction, current_price, ob, atr_m5)
+        entry = chase["suggested_entry"] if chase else current_price
+        entry_type = "limit" if chase else "market"
+
         # Dùng ATR để đặt SL theo biến động thực tế của thị trường (thay vì số pip cố định cứng nhắc)
         sl_distance = max(atr_m5 * 1.5, RISK_PER_TRADE_PIPS * 0.01 * 0.5)
-        # Tỷ lệ TP:SL = 3.0 -> áp dụng từ kết quả backtest (kỳ vọng dương nhất trên mẫu đủ lớn,
+        # Tỷ lệ TP:SL = 2.0 -> áp dụng từ kết quả backtest (kỳ vọng dương nhất trên mẫu đủ lớn,
         # xem run_sweep() trong backtest.py). TP2/TP3 đặt xa hơn TP1 để chốt lời từng phần.
         tp1_distance = sl_distance * 2.0
 
@@ -743,7 +775,10 @@ def generate_signal():
             tp2 = entry - tp1_distance * 1.3
             tp3 = entry - tp1_distance * 1.6
 
-        result.update({"entry": entry, "sl": sl, "tp1": tp1, "tp2": tp2, "tp3": tp3})
+        result.update({
+            "entry": entry, "sl": sl, "tp1": tp1, "tp2": tp2, "tp3": tp3,
+            "entry_type": entry_type, "chase_warning": chase,
+        })
         result["fib_note"] = fib_confluence_note(fib, entry, sl, tp1, atr_m5)
 
     return result
@@ -819,7 +854,14 @@ def format_message(sig, win_stats=None):
             lines.append("   target gần hơn, phù hợp lúc thị trường không có xu hướng rõ.")
         else:
             lines.append(f"{icon} {sig['direction']}")
-        lines.append(f"📍 Entry: {sig['entry']:.2f}")
+
+        if sig.get("chase_warning"):
+            cw = sig["chase_warning"]
+            lines.append(f"   ⏳ Giá đã chạy {cw['distance_atr']}x ATR khỏi vùng OB — CHỜ GIÁ VỀ, không mua/bán đuổi")
+            lines.append(f"📍 Entry (chờ, limit): {sig['entry']:.2f}")
+        else:
+            lines.append(f"📍 Entry (vào ngay, market): {sig['entry']:.2f}")
+
         lines.append(f"🛑 SL: {sig['sl']:.2f}")
         lines.append(f"✅ TP: {sig['tp1']:.2f} / {sig['tp2']:.2f} / {sig['tp3']:.2f}")
     elif sig["block_reason"]:
