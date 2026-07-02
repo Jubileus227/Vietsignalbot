@@ -8,10 +8,11 @@
 # ============================================================
 
 import os
+import json
 import requests
 import pandas as pd
 import numpy as np
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 
 # ============================================================
 # CONFIG — ĐIỀN THÔNG TIN CỦA BẠN VÀO ĐÂY (nếu chạy trên Colab)
@@ -23,6 +24,18 @@ TELEGRAM_CHAT_ID    = os.environ.get("TELEGRAM_CHAT_ID", "DÁN_CHAT_ID_CỦA_B�
 SYMBOL = "XAU/USD"
 RISK_PER_TRADE_PIPS = 200   # khoảng cách SL mặc định (điểm), có thể chỉnh
 SIGNAL_THRESHOLD = 4        # chỉ gửi Telegram khi |điểm tổng hợp| >= giá trị này (thang điểm tối đa hiện tại là ±7)
+
+ADX_MIN = 20                # ADX dưới mức này coi là thị trường đi ngang -> không khuyến nghị vào lệnh
+SESSION_FILTER_ENABLED = True   # bật/tắt bộ lọc phiên thanh khoản cao
+SESSION_START_UTC = 7       # 07:00 UTC ~ 14:00 giờ VN (mở phiên London)
+SESSION_END_UTC = 21        # 21:00 UTC ~ 04:00 giờ VN hôm sau (đóng phiên New York)
+
+FINNHUB_API_KEY = os.environ.get("FINNHUB_API_KEY", "")  # để trống nếu không dùng cảnh báo tin tức
+NEWS_WARNING_MINUTES = 45   # cảnh báo nếu có tin quan trọng trong vòng X phút tới
+
+SIGNAL_LOG_PATH = "signal_log.json"   # file lưu lịch sử tín hiệu để tự tính tỷ lệ thắng/thua
+SIGNAL_LOG_MAX = 300                  # số bản ghi tối đa giữ lại trong file log
+SIGNAL_TIMEOUT_HOURS = 4              # sau X giờ chưa chạm TP/SL thì coi là hết hạn, không tính thắng/thua
 
 # ============================================================
 # 1. LẤY DỮ LIỆU GIÁ TỪ TWELVE DATA
@@ -159,6 +172,86 @@ def detect_order_block(df, lookback=20):
     return None
 
 
+def adx(df, period=14):
+    """
+    ADX (Average Directional Index) — đo ĐỘ MẠNH của xu hướng, không quan tâm hướng.
+    ADX < 20: xu hướng yếu / thị trường đi ngang -> tín hiệu trend dễ sai.
+    ADX > 25: xu hướng đang rõ ràng, tín hiệu trend đáng tin hơn.
+    """
+    high, low, close = df["high"], df["low"], df["close"]
+
+    plus_dm = high.diff()
+    minus_dm = -low.diff()
+    plus_dm = plus_dm.where((plus_dm > minus_dm) & (plus_dm > 0), 0.0)
+    minus_dm = minus_dm.where((minus_dm > plus_dm) & (minus_dm > 0), 0.0)
+
+    prev_close = close.shift(1)
+    tr = pd.concat([
+        high - low,
+        (high - prev_close).abs(),
+        (low - prev_close).abs(),
+    ], axis=1).max(axis=1)
+
+    atr_ = tr.ewm(alpha=1 / period, adjust=False).mean()
+    plus_di = 100 * (plus_dm.ewm(alpha=1 / period, adjust=False).mean() / atr_.replace(0, np.nan))
+    minus_di = 100 * (minus_dm.ewm(alpha=1 / period, adjust=False).mean() / atr_.replace(0, np.nan))
+
+    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
+    adx_ = dx.ewm(alpha=1 / period, adjust=False).mean()
+    return adx_.fillna(0)
+
+
+def is_active_session(now_utc=None):
+    """
+    Kiểm tra hiện tại có đang trong phiên thanh khoản cao (London + New York) không.
+    Ngoài khung này, giá dễ đi ngang/nhiễu, tín hiệu kém tin cậy hơn.
+    """
+    if not SESSION_FILTER_ENABLED:
+        return True
+    now_utc = now_utc or datetime.now(timezone.utc)
+    hour = now_utc.hour
+    if SESSION_START_UTC <= SESSION_END_UTC:
+        return SESSION_START_UTC <= hour < SESSION_END_UTC
+    return hour >= SESSION_START_UTC or hour < SESSION_END_UTC
+
+
+def check_upcoming_news():
+    """
+    Kiểm tra tin kinh tế quan trọng (USD, high impact) sắp ra trong NEWS_WARNING_MINUTES phút tới.
+    Dùng Finnhub (cần FINNHUB_API_KEY, để trống thì bỏ qua tính năng này).
+    Trả về tên sự kiện gần nhất nếu có, hoặc None. Lỗi mạng/API sẽ bị bỏ qua êm (không làm chết bot).
+    """
+    if not FINNHUB_API_KEY:
+        return None
+    try:
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        url = "https://finnhub.io/api/v1/calendar/economic"
+        params = {"from": today, "to": today, "token": FINNHUB_API_KEY}
+        r = requests.get(url, params=params, timeout=10)
+        data = r.json()
+        events = data.get("economicCalendar", data.get("data", []))
+        now_utc = datetime.now(timezone.utc)
+
+        for ev in events:
+            impact = str(ev.get("impact", "")).lower()
+            country = str(ev.get("country", ev.get("economy", ""))).upper()
+            if impact not in ("3", "high") or country not in ("US", "USD"):
+                continue
+            ev_time_str = ev.get("time") or ev.get("data")
+            if not ev_time_str:
+                continue
+            try:
+                ev_time = pd.to_datetime(ev_time_str, utc=True)
+            except Exception:
+                continue
+            minutes_away = (ev_time - now_utc).total_seconds() / 60
+            if 0 <= minutes_away <= NEWS_WARNING_MINUTES:
+                return f"{ev.get('event', ev.get('name', 'Tin quan trọng'))} lúc {ev_time.strftime('%H:%M UTC')}"
+        return None
+    except Exception:
+        return None  # không để lỗi API tin tức làm chết cả bot
+
+
 def rsi(series, period=14):
     """RSI chuẩn — đo quá mua (>70) / quá bán (<30)"""
     delta = series.diff()
@@ -205,6 +298,82 @@ def detect_fvg(df):
 
 
 # ============================================================
+# 2b. TỰ THEO DÕI KẾT QUẢ TÍN HIỆU (WIN-RATE TRACKING)
+# ============================================================
+def load_signal_log():
+    if not os.path.exists(SIGNAL_LOG_PATH):
+        return []
+    try:
+        with open(SIGNAL_LOG_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+
+def save_signal_log(log):
+    log = log[-SIGNAL_LOG_MAX:]
+    with open(SIGNAL_LOG_PATH, "w", encoding="utf-8") as f:
+        json.dump(log, f, ensure_ascii=False, indent=2)
+
+
+def update_signal_outcomes(log, current_price):
+    """Kiểm tra các tín hiệu 'pending' cũ đã chạm TP1, chạm SL, hay hết hạn chưa."""
+    now = datetime.now(timezone.utc)
+    for rec in log:
+        if rec.get("status") != "pending":
+            continue
+        try:
+            rec_time = datetime.fromisoformat(rec["time_iso"])
+        except Exception:
+            rec["status"] = "expired"
+            continue
+
+        if rec["direction"] == "BUY":
+            if current_price >= rec["tp1"]:
+                rec["status"] = "win"
+            elif current_price <= rec["sl"]:
+                rec["status"] = "loss"
+        else:  # SELL
+            if current_price <= rec["tp1"]:
+                rec["status"] = "win"
+            elif current_price >= rec["sl"]:
+                rec["status"] = "loss"
+
+        if rec["status"] == "pending" and (now - rec_time) > timedelta(hours=SIGNAL_TIMEOUT_HOURS):
+            rec["status"] = "expired"
+    return log
+
+
+def append_signal(log, sig):
+    """Thêm tín hiệu vừa tạo (nếu có hướng BUY/SELL) vào log để theo dõi sau này."""
+    if not sig.get("direction"):
+        return log
+    log.append({
+        "time_iso": datetime.now(timezone.utc).isoformat(),
+        "direction": sig["direction"],
+        "entry": sig["entry"],
+        "sl": sig["sl"],
+        "tp1": sig["tp1"],
+        "score": sig["score"],
+        "status": "pending",
+    })
+    return log
+
+
+def compute_win_rate(log):
+    closed = [r for r in log if r.get("status") in ("win", "loss")]
+    wins = [r for r in closed if r["status"] == "win"]
+    if not closed:
+        return None
+    return {
+        "wins": len(wins),
+        "losses": len(closed) - len(wins),
+        "total": len(closed),
+        "win_rate": round(len(wins) / len(closed) * 100, 1),
+    }
+
+
+# ============================================================
 # 3. LOGIC TẠO TÍN HIỆU
 # ============================================================
 def generate_signal():
@@ -226,7 +395,11 @@ def generate_signal():
 
     rsi_m5 = rsi(df_m5["close"]).iloc[-1]
     atr_m5 = atr(df_m5).iloc[-1]
+    adx_m15 = adx(df_m15).iloc[-1]
     sr = support_resistance(df_m5)
+
+    session_ok = is_active_session()
+    news_warning = check_upcoming_news()
 
     # --- Chấm điểm đơn giản (bạn có thể chỉnh trọng số) ---
     # Thang điểm tối đa: trend M5/M15/M30 (±1 mỗi cái) + pattern (±2) + BOS (±1) + OB (±1) = ±7
@@ -245,10 +418,27 @@ def generate_signal():
     if ob and ob["type"] == "bearish": score -= 1
 
     direction = None
+    block_reason = None
     if score >= 3:
         direction = "BUY"
     elif score <= -3:
         direction = "SELL"
+
+    # --- Các bộ lọc chặn tín hiệu nếu điều kiện thị trường không thuận lợi ---
+    # Lưu ý: chỉ ADX và tin tức mới CHẶN khuyến nghị (rủi ro sai cao).
+    # Ngoài phiên thanh khoản cao thì KHÔNG chặn, chỉ cảnh báo thêm trong tin nhắn
+    # (xem dòng "Phiên thanh khoản cao" và "liquidity_note" ở phần format).
+    if direction:
+        if adx_m15 < ADX_MIN:
+            direction = None
+            block_reason = f"ADX(M15)={adx_m15:.1f} < {ADX_MIN} -> thị trường đang đi ngang, tạm ẩn khuyến nghị"
+        elif news_warning:
+            direction = None
+            block_reason = f"Sắp có tin quan trọng: {news_warning} -> tạm ẩn khuyến nghị để tránh SL bị quét"
+
+    liquidity_note = None
+    if not session_ok:
+        liquidity_note = "Đang ngoài phiên thanh khoản cao (London/New York) — giá dễ nhiễu/đi ngang hơn bình thường, cân nhắc khối lượng nhỏ hơn nếu vào lệnh."
 
     current_price = df_m5.iloc[-1]["close"]
 
@@ -304,9 +494,14 @@ def generate_signal():
         "ob": ob,
         "rsi": rsi_m5,
         "atr": atr_m5,
+        "adx": adx_m15,
         "support": sr["support"],
         "resistance": sr["resistance"],
         "overview": overview,
+        "session_ok": session_ok,
+        "liquidity_note": liquidity_note,
+        "news_warning": news_warning,
+        "block_reason": block_reason,
     }
 
     if direction:
@@ -333,7 +528,7 @@ def generate_signal():
 # ============================================================
 # 4. FORMAT TIN NHẮN & GỬI TELEGRAM
 # ============================================================
-def format_message(sig):
+def format_message(sig, win_stats=None):
     trend_icon = lambda t: "⬆️" if t == "up" else "⬇️"
     trend_label = lambda t: "Tăng" if t == "up" else "Giảm"
 
@@ -364,8 +559,13 @@ def format_message(sig):
     if sig["pattern"] != "none":
         lines.append(f"🕯️ Mẫu nến M5: {sig['pattern']}")
 
-    lines.append(f"📈 RSI(14): {sig['rsi']:.1f}   |   ATR(14): {sig['atr']:.2f}")
+    lines.append(f"📈 RSI(14): {sig['rsi']:.1f}   |   ATR(14): {sig['atr']:.2f}   |   ADX(M15): {sig['adx']:.1f}")
     lines.append(f"🧱 Hỗ trợ: {sig['support']:.2f}   |   Kháng cự: {sig['resistance']:.2f}")
+    lines.append(f"🕐 Phiên thanh khoản cao: {'Có' if sig['session_ok'] else 'Không'}")
+    if sig["liquidity_note"]:
+        lines.append(f"⚠️ {sig['liquidity_note']}")
+    if sig["news_warning"]:
+        lines.append(f"📰 Cảnh báo tin: {sig['news_warning']}")
 
     lines.append("─────────────────────")
     lines.append(f"📐 Điểm tổng hợp: {sig['score']} / ±7")
@@ -377,9 +577,17 @@ def format_message(sig):
         lines.append(f"📍 Entry: {sig['entry']:.2f}")
         lines.append(f"🛑 SL: {sig['sl']:.2f}")
         lines.append(f"✅ TP: {sig['tp1']:.2f} / {sig['tp2']:.2f} / {sig['tp3']:.2f}")
+    elif sig["block_reason"]:
+        lines.append("")
+        lines.append(f"⚪ Có tín hiệu điểm số nhưng bị chặn: {sig['block_reason']}")
     else:
         lines.append("")
         lines.append("⚪ Chưa đủ tín hiệu rõ ràng để vào lệnh lúc này")
+
+    if win_stats:
+        lines.append("─────────────────────")
+        lines.append(f"🎯 Lịch sử tín hiệu: {win_stats['wins']} thắng / {win_stats['losses']} thua "
+                      f"({win_stats['win_rate']}% trên {win_stats['total']} lệnh đã đóng)")
 
     lines.append("")
     lines.append("⚠️ Chỉ tham khảo | Quản lý vốn 1-2%")
@@ -402,7 +610,15 @@ def send_telegram(message):
 if __name__ == "__main__":
     print("Đang lấy dữ liệu và phân tích...")
     signal = generate_signal()
-    message = format_message(signal)
+
+    # --- Cập nhật kết quả các tín hiệu cũ, thêm tín hiệu mới, tính tỷ lệ thắng/thua ---
+    log = load_signal_log()
+    log = update_signal_outcomes(log, signal["price"])
+    log = append_signal(log, signal)
+    save_signal_log(log)
+    win_stats = compute_win_rate(log)
+
+    message = format_message(signal, win_stats=win_stats)
     print(message)
 
     print("\nĐang gửi vào Telegram...")
