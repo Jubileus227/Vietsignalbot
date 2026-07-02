@@ -143,6 +143,36 @@ def detect_order_block(df, lookback=20):
     return None
 
 
+def rsi(series, period=14):
+    """RSI chuẩn — đo quá mua (>70) / quá bán (<30)"""
+    delta = series.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.ewm(alpha=1 / period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / period, adjust=False).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    result = 100 - (100 / (1 + rs))
+    return result.fillna(50)
+
+
+def atr(df, period=14):
+    """Average True Range — đo mức độ biến động hiện tại"""
+    high, low, close = df["high"], df["low"], df["close"]
+    prev_close = close.shift(1)
+    tr = pd.concat([
+        high - low,
+        (high - prev_close).abs(),
+        (low - prev_close).abs(),
+    ], axis=1).max(axis=1)
+    return tr.ewm(span=period, adjust=False).mean()
+
+
+def support_resistance(df, lookback=30):
+    """Vùng hỗ trợ/kháng cự gần nhất = đáy/đỉnh gần nhất trong lookback nến"""
+    recent = df.iloc[-lookback:]
+    return {"support": recent["low"].min(), "resistance": recent["high"].max()}
+
+
 def detect_fvg(df):
     """
     Fair Value Gap đơn giản: khoảng trống giữa nến[-3] và nến[-1]
@@ -175,6 +205,10 @@ def generate_signal():
     bos = detect_bos(df_m5)
     fvg = detect_fvg(df_m5)
     ob = detect_order_block(df_m5)
+
+    rsi_m5 = rsi(df_m5["close"]).iloc[-1]
+    atr_m5 = atr(df_m5).iloc[-1]
+    sr = support_resistance(df_m5)
 
     # --- Chấm điểm đơn giản (bạn có thể chỉnh trọng số) ---
     # Thang điểm tối đa: trend M5/M15/M30 (±1 mỗi cái) + pattern (±2) + BOS (±1) + OB (±1) = ±7
@@ -210,6 +244,32 @@ def generate_signal():
     # Mức độ mạnh của tín hiệu, quy ra thang 10 để dễ hình dung
     strength_10 = round(min(10, abs(score) / 7 * 10), 1)
 
+    # --- Nhận định tổng quan (ghép các yếu tố thành 1-2 câu dễ hiểu) ---
+    notes = []
+    if rsi_m5 >= 70:
+        notes.append("RSI cho thấy vùng quá mua, cẩn trọng nếu mua đuổi")
+    elif rsi_m5 <= 30:
+        notes.append("RSI cho thấy vùng quá bán, cẩn trọng nếu bán đuổi")
+    else:
+        notes.append("RSI trung tính, chưa quá mua/quá bán")
+
+    trend_count_up = sum(1 for t in [trend_m5, trend_m15, trend_m30] if t == "up")
+    if trend_count_up == 3:
+        notes.append("cả 3 khung đều đồng thuận tăng")
+    elif trend_count_up == 0:
+        notes.append("cả 3 khung đều đồng thuận giảm")
+    else:
+        notes.append("các khung thời gian đang lệch hướng nhau, độ tin cậy thấp hơn")
+
+    dist_to_res = sr["resistance"] - current_price
+    dist_to_sup = current_price - sr["support"]
+    if dist_to_res < dist_to_sup:
+        notes.append(f"giá đang gần kháng cự {sr['resistance']:.2f} hơn, khả năng bị cản")
+    else:
+        notes.append(f"giá đang gần hỗ trợ {sr['support']:.2f} hơn, khả năng được nâng đỡ")
+
+    overview = "; ".join(notes) + "."
+
     result = {
         "time": datetime.now().strftime("%H:%M:%S %d/%m"),
         "price": current_price,
@@ -224,12 +284,17 @@ def generate_signal():
         "bos": bos,
         "fvg": fvg,
         "ob": ob,
+        "rsi": rsi_m5,
+        "atr": atr_m5,
+        "support": sr["support"],
+        "resistance": sr["resistance"],
+        "overview": overview,
     }
 
     if direction:
         entry = current_price
-        pip_value = 0.01  # với vàng trên nhiều sàn, 1 pip ~ 0.01 (kiểm tra lại với sàn bạn dùng)
-        sl_distance = RISK_PER_TRADE_PIPS * pip_value
+        # Dùng ATR để đặt SL theo biến động thực tế của thị trường (thay vì số pip cố định cứng nhắc)
+        sl_distance = max(atr_m5 * 1.5, RISK_PER_TRADE_PIPS * 0.01 * 0.5)
 
         if direction == "BUY":
             sl = entry - sl_distance
@@ -281,8 +346,12 @@ def format_message(sig):
     if sig["pattern"] != "none":
         lines.append(f"🕯️ Mẫu nến M5: {sig['pattern']}")
 
+    lines.append(f"📈 RSI(14): {sig['rsi']:.1f}   |   ATR(14): {sig['atr']:.2f}")
+    lines.append(f"🧱 Hỗ trợ: {sig['support']:.2f}   |   Kháng cự: {sig['resistance']:.2f}")
+
     lines.append("─────────────────────")
-    lines.append(f"📐 Điểm tổng hợp: {sig['score']} (ngưỡng báo: ±{SIGNAL_THRESHOLD})")
+    lines.append(f"📐 Điểm tổng hợp: {sig['score']} / ±7")
+    lines.append(f"🧠 Nhận định: {sig['overview']}")
 
     if sig["direction"]:
         lines.append("")
@@ -292,7 +361,7 @@ def format_message(sig):
         lines.append(f"✅ TP: {sig['tp1']:.2f} / {sig['tp2']:.2f} / {sig['tp3']:.2f}")
     else:
         lines.append("")
-        lines.append("⚪ Chưa đạt ngưỡng tín hiệu mạnh — chờ thêm")
+        lines.append("⚪ Chưa đủ tín hiệu rõ ràng để vào lệnh lúc này")
 
     lines.append("")
     lines.append("⚠️ Chỉ tham khảo | Quản lý vốn 1-2%")
@@ -318,9 +387,6 @@ if __name__ == "__main__":
     message = format_message(signal)
     print(message)
 
-    if abs(signal["score"]) >= SIGNAL_THRESHOLD:
-        print(f"\nĐiểm {signal['score']} đạt ngưỡng {SIGNAL_THRESHOLD} -> đang gửi Telegram...")
-        send_telegram(message)
-        print("Đã gửi xong! Kiểm tra Telegram của bạn.")
-    else:
-        print(f"\nĐiểm {signal['score']} chưa đạt ngưỡng ±{SIGNAL_THRESHOLD} -> không gửi (tránh spam).")
+    print("\nĐang gửi vào Telegram...")
+    send_telegram(message)
+    print("Đã gửi xong! Kiểm tra Telegram của bạn.")
